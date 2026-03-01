@@ -1,291 +1,323 @@
 import sys
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QToolBar,
-                             QAction, QColorDialog, QSlider, QLabel, QHBoxLayout)
-from PyQt5.QtCore import Qt, QPoint, QRect
-from PyQt5.QtGui import QPainter, QPen, QColor, QPixmap, QCursor, QIcon
+import os
+import zipfile
+import shutil
+from pathlib import Path
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QListWidget, QListWidgetItem, QLabel, QFileDialog,
+    QMessageBox, QProgressBar, QAbstractItemView
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 
 
-class Canvas(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setStyleSheet("background: transparent;")
-        self.drawing = False
-        self.last_point = QPoint()
-        self.tool = "pen"  # "pen" or "eraser"
-        self.pen_color = QColor(255, 0, 0)  # 기본 빨간색
-        self.pen_width = 3
-        self.eraser_width = 30
-        self.pixmap = None
+class MergeWorker(QThread):
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
 
-    def resizeEvent(self, event):
-        if self.pixmap is None or self.pixmap.size() != self.size():
-            new_pixmap = QPixmap(self.size())
-            new_pixmap.fill(Qt.transparent)
-            if self.pixmap:
-                painter = QPainter(new_pixmap)
-                painter.drawPixmap(0, 0, self.pixmap)
-                painter.end()
-            self.pixmap = new_pixmap
-        super().resizeEvent(event)
+    def __init__(self, file_paths, output_path):
+        super().__init__()
+        self.file_paths = file_paths
+        self.output_path = output_path
 
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        if self.pixmap:
-            painter.drawPixmap(0, 0, self.pixmap)
+    def run(self):
+        try:
+            ext = Path(self.file_paths[0]).suffix.lower()
+            if ext == '.hwpx':
+                self._merge_hwpx()
+            elif ext == '.hwp':
+                self._merge_hwp()
+        except Exception as e:
+            self.error.emit(str(e))
 
-    def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.drawing = True
-            self.last_point = event.pos()
+    def _merge_hwpx(self):
+        """HWPX(ZIP 기반) 파일 합치기"""
+        import xml.etree.ElementTree as ET
 
-    def mouseMoveEvent(self, event):
-        if self.drawing and self.pixmap:
-            painter = QPainter(self.pixmap)
-            if self.tool == "pen":
-                pen = QPen(self.pen_color, self.pen_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
-                painter.setPen(pen)
-                painter.drawLine(self.last_point, event.pos())
-            elif self.tool == "eraser":
-                painter.setCompositionMode(QPainter.CompositionMode_Clear)
-                painter.setPen(QPen(Qt.transparent, self.eraser_width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-                painter.drawLine(self.last_point, event.pos())
-            painter.end()
-            self.last_point = event.pos()
-            self.update()
+        self.progress.emit(0, "첫 번째 파일 읽는 중...")
+        base_path = self.file_paths[0]
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.drawing = False
+        # 임시 작업 디렉토리
+        tmp_dir = Path(self.output_path).parent / "_hwpx_tmp"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir()
 
-    def clear(self):
-        if self.pixmap:
-            self.pixmap.fill(Qt.transparent)
-            self.update()
+        try:
+            # 첫 번째 파일을 기준으로 압축 해제
+            base_dir = tmp_dir / "base"
+            with zipfile.ZipFile(base_path, 'r') as z:
+                z.extractall(base_dir)
+
+            # 기준 파일의 BodyText 섹션 파일 목록 수집
+            body_dir = base_dir / "Contents"
+            section_files = sorted(body_dir.glob("Section*.xml")) if body_dir.exists() else []
+            section_count = len(section_files)
+
+            for i, fp in enumerate(self.file_paths[1:], 1):
+                self.progress.emit(
+                    int(i / len(self.file_paths) * 80),
+                    f"{Path(fp).name} 합치는 중..."
+                )
+                add_dir = tmp_dir / f"add_{i}"
+                with zipfile.ZipFile(fp, 'r') as z:
+                    z.extractall(add_dir)
+
+                add_body = add_dir / "Contents"
+                add_sections = sorted(add_body.glob("Section*.xml")) if add_body.exists() else []
+
+                for sec in add_sections:
+                    new_name = f"Section{section_count}.xml"
+                    shutil.copy(sec, body_dir / new_name)
+                    section_count += 1
+
+            # contents.hpf (목차) 업데이트
+            hpf_path = base_dir / "Contents" / "content.hpf"
+            if not hpf_path.exists():
+                hpf_path = base_dir / "content.hpf"
+
+            if hpf_path.exists():
+                tree = ET.parse(hpf_path)
+                root = tree.getroot()
+                ns = {'opf': 'http://www.idpf.org/2007/opf'}
+                manifest = root.find('.//manifest', ns) or root.find('.//manifest')
+                spine = root.find('.//spine', ns) or root.find('.//spine')
+
+                if manifest is not None and spine is not None:
+                    # 새로 추가된 섹션 등록
+                    existing_items = {item.get('href') for item in manifest}
+                    for idx in range(section_count):
+                        href = f"Section{idx}.xml"
+                        if href not in existing_items:
+                            item_id = f"section{idx}"
+                            ET.SubElement(manifest, 'item', {
+                                'id': item_id,
+                                'href': href,
+                                'media-type': 'application/xml'
+                            })
+                            ET.SubElement(spine, 'itemref', {'idref': item_id})
+                    tree.write(hpf_path, encoding='utf-8', xml_declaration=True)
+
+            # 결과물 압축
+            self.progress.emit(90, "파일 저장 중...")
+            output = self.output_path
+            if not output.endswith('.hwpx'):
+                output += '.hwpx'
+
+            with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as zout:
+                for f in base_dir.rglob('*'):
+                    if f.is_file():
+                        zout.write(f, f.relative_to(base_dir))
+
+            self.progress.emit(100, "완료!")
+            self.finished.emit(output)
+
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _merge_hwp(self):
+        """HWP(바이너리) 파일 합치기 - hwp5 라이브러리 사용"""
+        try:
+            import hwp5
+            from hwp5.xmlmodel import Hwp5File
+        except ImportError:
+            self.error.emit(
+                "HWP 바이너리 형식 처리를 위해 pyhwp 라이브러리가 필요합니다.\n"
+                "pip install pyhwp 를 실행해주세요.\n\n"
+                "※ HWP 형식은 바이너리 구조상 완전한 합치기가 제한적입니다.\n"
+                "가능하면 HWPX 형식(.hwpx)으로 저장 후 사용하세요."
+            )
+            return
+
+        # pyhwp 기반 처리 (섹션 단위 병합)
+        self.progress.emit(50, "HWP 파일 처리 중 (제한적 지원)...")
+        self.error.emit(
+            "HWP 바이너리 형식은 완전한 자동 합치기가 어렵습니다.\n"
+            "한컴오피스에서 파일을 HWPX 형식으로 저장 후 다시 시도해주세요."
+        )
 
 
-class TransparentBoard(QMainWindow):
+class DropListWidget(QListWidget):
+    """드래그&드롭 지원 리스트"""
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("투명 칠판")
-        self.setWindowFlags(
-            Qt.FramelessWindowHint |
-            Qt.WindowStaysOnTopHint |
-            Qt.Tool
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event: QDropEvent):
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                path = url.toLocalFile()
+                if path.lower().endswith(('.hwp', '.hwpx')):
+                    self._add_file(path)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+
+    def _add_file(self, path):
+        # 중복 방지
+        for i in range(self.count()):
+            if self.item(i).data(Qt.UserRole) == path:
+                return
+        item = QListWidgetItem(f"📄 {Path(path).name}")
+        item.setData(Qt.UserRole, path)
+        item.setToolTip(path)
+        self.addItem(item)
+
+
+class HwpMergerApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("HWP / HWPX 파일 합치기")
+        self.setMinimumSize(600, 500)
+        self._build_ui()
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        # 안내 레이블
+        info = QLabel("📂 HWP / HWPX 파일을 추가하고 순서를 정렬한 뒤 합치기를 실행하세요.\n"
+                      "파일을 드래그&드롭하거나 아래 버튼으로 추가할 수 있습니다.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        # 파일 목록
+        self.list_widget = DropListWidget()
+        layout.addWidget(self.list_widget)
+
+        # 버튼 행 1 - 파일 관리
+        btn_row1 = QHBoxLayout()
+        self.btn_add = QPushButton("➕ 파일 추가")
+        self.btn_up = QPushButton("⬆ 위로")
+        self.btn_down = QPushButton("⬇ 아래로")
+        self.btn_remove = QPushButton("🗑 선택 삭제")
+        self.btn_clear = QPushButton("✖ 전체 삭제")
+        for btn in [self.btn_add, self.btn_up, self.btn_down, self.btn_remove, self.btn_clear]:
+            btn_row1.addWidget(btn)
+        layout.addLayout(btn_row1)
+
+        # 버튼 행 2 - 실행
+        btn_row2 = QHBoxLayout()
+        self.btn_merge = QPushButton("🔗 합치기 실행")
+        self.btn_merge.setFixedHeight(40)
+        self.btn_merge.setStyleSheet("font-size: 14px; font-weight: bold; background-color: #4CAF50; color: white;")
+        btn_row2.addWidget(self.btn_merge)
+        layout.addLayout(btn_row2)
+
+        # 진행바
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("")
+        layout.addWidget(self.status_label)
+
+        # 시그널 연결
+        self.btn_add.clicked.connect(self.add_files)
+        self.btn_up.clicked.connect(self.move_up)
+        self.btn_down.clicked.connect(self.move_down)
+        self.btn_remove.clicked.connect(self.remove_selected)
+        self.btn_clear.clicked.connect(self.clear_all)
+        self.btn_merge.clicked.connect(self.run_merge)
+
+    def add_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "HWP/HWPX 파일 선택", "",
+            "한글 파일 (*.hwp *.hwpx);;HWP (*.hwp);;HWPX (*.hwpx)"
         )
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setGeometry(100, 100, 1200, 700)
+        for f in files:
+            self.list_widget._add_file(f)
 
-        # 드래그 관련 변수
-        self._drag_pos = None
-        self._resizing = False
+    def move_up(self):
+        row = self.list_widget.currentRow()
+        if row > 0:
+            item = self.list_widget.takeItem(row)
+            self.list_widget.insertItem(row - 1, item)
+            self.list_widget.setCurrentRow(row - 1)
 
-        self._init_ui()
+    def move_down(self):
+        row = self.list_widget.currentRow()
+        if row < self.list_widget.count() - 1:
+            item = self.list_widget.takeItem(row)
+            self.list_widget.insertItem(row + 1, item)
+            self.list_widget.setCurrentRow(row + 1)
 
-    def _init_ui(self):
-        # 메인 위젯
-        self.central = QWidget(self)
-        self.central.setObjectName("central")
-        self.central.setStyleSheet("""
-            #central {
-                background: transparent;
-                border: 2px solid rgba(100, 149, 237, 180);
-                border-radius: 8px;
-            }
-        """)
-        self.setCentralWidget(self.central)
+    def remove_selected(self):
+        for item in self.list_widget.selectedItems():
+            self.list_widget.takeItem(self.list_widget.row(item))
 
-        from PyQt5.QtWidgets import QVBoxLayout
-        main_layout = QVBoxLayout(self.central)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+    def clear_all(self):
+        self.list_widget.clear()
 
-        # ── 툴바 (드래그 핸들 겸) ──
-        self.toolbar = QWidget()
-        self.toolbar.setFixedHeight(44)
-        self.toolbar.setStyleSheet("""
-            background: rgba(30, 30, 60, 210);
-            border-radius: 6px;
-        """)
-        toolbar_layout = QHBoxLayout(self.toolbar)
-        toolbar_layout.setContentsMargins(8, 4, 8, 4)
-        toolbar_layout.setSpacing(6)
+    def get_file_paths(self):
+        return [
+            self.list_widget.item(i).data(Qt.UserRole)
+            for i in range(self.list_widget.count())
+        ]
 
-        def btn(text, tooltip, slot, checked=False):
-            from PyQt5.QtWidgets import QPushButton
-            b = QPushButton(text)
-            b.setToolTip(tooltip)
-            b.setCheckable(True)
-            b.setChecked(checked)
-            b.setFixedSize(70, 32)
-            b.setStyleSheet("""
-                QPushButton {
-                    background: rgba(80,80,120,200);
-                    color: white; border-radius: 5px;
-                    font-size: 13px; font-weight: bold;
-                }
-                QPushButton:checked { background: rgba(100,180,255,220); color: #111; }
-                QPushButton:hover   { background: rgba(120,120,180,220); }
-            """)
-            b.clicked.connect(slot)
-            return b
+    def run_merge(self):
+        paths = self.get_file_paths()
+        if len(paths) < 2:
+            QMessageBox.warning(self, "경고", "합칠 파일을 2개 이상 추가해주세요.")
+            return
 
-        self.pen_btn = btn("✏️ 펜", "펜 도구", self._use_pen, checked=True)
-        self.eraser_btn = btn("🧹 지우개", "지우개 도구", self._use_eraser)
+        # 확장자 일관성 체크
+        exts = set(Path(p).suffix.lower() for p in paths)
+        if len(exts) > 1:
+            QMessageBox.warning(self, "경고", "HWP와 HWPX 파일을 혼합할 수 없습니다.\n같은 형식의 파일만 선택해주세요.")
+            return
 
-        # 색상 버튼
-        from PyQt5.QtWidgets import QPushButton
-        self.color_btn = QPushButton("🎨 색상")
-        self.color_btn.setFixedSize(70, 32)
-        self.color_btn.setToolTip("펜 색상 선택")
-        self.color_btn.setStyleSheet("""
-            QPushButton {
-                background: rgba(80,80,120,200);
-                color: white; border-radius: 5px;
-                font-size: 13px; font-weight: bold;
-            }
-            QPushButton:hover { background: rgba(120,120,180,220); }
-        """)
-        self.color_btn.clicked.connect(self._pick_color)
+        ext = exts.pop()
+        output, _ = QFileDialog.getSaveFileName(
+            self, "저장 위치 선택", f"merged{ext}",
+            f"한글 파일 (*{ext})"
+        )
+        if not output:
+            return
 
-        # 굵기 슬라이더
-        size_label = QLabel("굵기:")
-        size_label.setStyleSheet("color: white; font-size: 12px;")
-        self.size_slider = QSlider(Qt.Horizontal)
-        self.size_slider.setRange(1, 20)
-        self.size_slider.setValue(3)
-        self.size_slider.setFixedWidth(80)
-        self.size_slider.setStyleSheet("QSlider::handle:horizontal { background: #64b5f6; }")
-        self.size_slider.valueChanged.connect(self._change_size)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.btn_merge.setEnabled(False)
 
-        # 지우개 크기 슬라이더
-        esize_label = QLabel("지우개:")
-        esize_label.setStyleSheet("color: white; font-size: 12px;")
-        self.esize_slider = QSlider(Qt.Horizontal)
-        self.esize_slider.setRange(10, 80)
-        self.esize_slider.setValue(30)
-        self.esize_slider.setFixedWidth(80)
-        self.esize_slider.setStyleSheet("QSlider::handle:horizontal { background: #ffb74d; }")
-        self.esize_slider.valueChanged.connect(self._change_esize)
+        self.worker = MergeWorker(paths, output)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.finished.connect(self.on_finished)
+        self.worker.error.connect(self.on_error)
+        self.worker.start()
 
-        # 전체 지우기
-        clear_btn = QPushButton("🗑️ 전체")
-        clear_btn.setFixedSize(70, 32)
-        clear_btn.setToolTip("전체 지우기")
-        clear_btn.setStyleSheet("""
-            QPushButton {
-                background: rgba(180,60,60,200);
-                color: white; border-radius: 5px;
-                font-size: 13px; font-weight: bold;
-            }
-            QPushButton:hover { background: rgba(220,80,80,220); }
-        """)
-        clear_btn.clicked.connect(self._clear)
+    def on_progress(self, value, msg):
+        self.progress_bar.setValue(value)
+        self.status_label.setText(msg)
 
-        # 닫기
-        close_btn = QPushButton("✕")
-        close_btn.setFixedSize(32, 32)
-        close_btn.setToolTip("닫기")
-        close_btn.setStyleSheet("""
-            QPushButton {
-                background: rgba(180,60,60,200);
-                color: white; border-radius: 5px;
-                font-size: 14px; font-weight: bold;
-            }
-            QPushButton:hover { background: rgba(220,80,80,220); }
-        """)
-        close_btn.clicked.connect(self.close)
+    def on_finished(self, output_path):
+        self.progress_bar.setValue(100)
+        self.btn_merge.setEnabled(True)
+        QMessageBox.information(self, "완료", f"파일이 저장되었습니다:\n{output_path}")
+        self.status_label.setText(f"✅ 저장 완료: {output_path}")
 
-        toolbar_layout.addWidget(self.pen_btn)
-        toolbar_layout.addWidget(self.eraser_btn)
-        toolbar_layout.addWidget(self.color_btn)
-        toolbar_layout.addWidget(size_label)
-        toolbar_layout.addWidget(self.size_slider)
-        toolbar_layout.addWidget(esize_label)
-        toolbar_layout.addWidget(self.esize_slider)
-        toolbar_layout.addStretch()
-        toolbar_layout.addWidget(clear_btn)
-        toolbar_layout.addWidget(close_btn)
-
-        # 드래그 이벤트 툴바에 설치
-        self.toolbar.mousePressEvent = self._tb_press
-        self.toolbar.mouseMoveEvent = self._tb_move
-        self.toolbar.mouseReleaseEvent = self._tb_release
-
-        # 캔버스
-        self.canvas = Canvas()
-
-        main_layout.addWidget(self.toolbar)
-        main_layout.addWidget(self.canvas, 1)
-
-        # 색상 미리보기 표시
-        self._update_color_btn()
-
-    # ── 툴바 드래그 ──
-    def _tb_press(self, event):
-        if event.button() == Qt.LeftButton:
-            self._drag_pos = event.globalPos() - self.frameGeometry().topLeft()
-
-    def _tb_move(self, event):
-        if self._drag_pos and event.buttons() == Qt.LeftButton:
-            self.move(event.globalPos() - self._drag_pos)
-
-    def _tb_release(self, event):
-        self._drag_pos = None
-
-    # ── 도구 선택 ──
-    def _use_pen(self):
-        self.canvas.tool = "pen"
-        self.pen_btn.setChecked(True)
-        self.eraser_btn.setChecked(False)
-
-    def _use_eraser(self):
-        self.canvas.tool = "eraser"
-        self.eraser_btn.setChecked(True)
-        self.pen_btn.setChecked(False)
-
-    def _pick_color(self):
-        color = QColorDialog.getColor(self.canvas.pen_color, self, "펜 색상 선택")
-        if color.isValid():
-            self.canvas.pen_color = color
-            self._update_color_btn()
-            self._use_pen()
-
-    def _update_color_btn(self):
-        c = self.canvas.pen_color
-        self.color_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: rgba({c.red()},{c.green()},{c.blue()},200);
-                color: {'black' if c.lightness() > 128 else 'white'};
-                border-radius: 5px; font-size: 13px; font-weight: bold;
-            }}
-            QPushButton:hover {{
-                background: rgba({c.red()},{c.green()},{c.blue()},255);
-            }}
-        """)
-
-    def _change_size(self, val):
-        self.canvas.pen_width = val
-
-    def _change_esize(self, val):
-        self.canvas.eraser_width = val
-
-    def _clear(self):
-        self.canvas.clear()
-
-    # ── 마우스 통과 (캔버스 영역) ──
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key_Escape:
-            self.close()
-
-
-def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("투명 칠판")
-    window = TransparentBoard()
-    window.show()
-    sys.exit(app.exec_())
+    def on_error(self, msg):
+        self.progress_bar.setVisible(False)
+        self.btn_merge.setEnabled(True)
+        QMessageBox.critical(self, "오류", msg)
+        self.status_label.setText("❌ 오류 발생")
 
 
 if __name__ == "__main__":
-    main()
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    window = HwpMergerApp()
+    window.show()
+    sys.exit(app.exec_())
